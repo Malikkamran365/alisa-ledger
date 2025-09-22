@@ -1,12 +1,8 @@
-streamlit>=1.32
-SQLAlchemy>=2.0
-reportlab>=4.0
+streamlit==1.37.1
+sqlalchemy>=2.0
 pandas>=2.0
-
-# Voice (optional but recommended)
-openai>=1.0.0
-streamlit-mic-recorder>=0.0.8
+reportlab>=4.0
+pyttsx3>=2.90
 gTTS>=2.5
-
-# If using macOS M1/M2 and you hit build issues, add:
-# typing_extensions>=4.7
+streamlit-mic-recorder>=0.0.8
+openai>=1.40

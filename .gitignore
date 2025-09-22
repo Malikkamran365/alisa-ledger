@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+ENV/
+env/
+
+# Streamlit local cache
+.streamlit/
+
+# App data
+ledger.db
+temp*.wav
+temp_voice.mp3
+whisper_debug.log
