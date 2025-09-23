@@ -35,11 +35,11 @@ except Exception:
 # Database setup
 # ----------------------------------------------------------------------------
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./ledger.db"
+SQLALCHEMY_DATABASE_URL = st.secrets["supabase"]["db_url"]
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
-    connect_args={"check_same_thread": False},  # Needed for SQLite concurrency
+    pool_pre_ping=True
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -272,27 +272,61 @@ def smart_agent(command: str, lang: str, db) -> str:
     """Interpret a voice/text command and execute ledger actions."""
     norm_cmd = normalize_text(command)
 
-    # Check if asking for balance of a customer
-    if "balance" in norm_cmd or "khata" in norm_cmd or "کھاتہ" in command:
-        custs = db.query(Customer).all()
-        for c in custs:
-            if normalize_text(c.name) in norm_cmd or normalize_text(c.name_ur) in norm_cmd:
-                # Compute balance
-                txs = db.query(Transaction).options(joinedload(Transaction.items)).filter(
-                    Transaction.customer_id == c.id
-                ).all()
-                bal = 0.0
-                for t in txs:
-                    amt = tx_amount(t)
-                    if t.type == "debit":
-                        bal += amt
-                    else:
-                        bal -= amt
-                return f"Balance for {c.name or c.name_ur}: {bal:,.2f}"
-        return "Customer not found."
+    # Try to identify the customer
+    cust = None
+    for c in db.query(Customer).all():
+        if normalize_text(c.name) in norm_cmd or normalize_text(c.name_ur) in norm_cmd:
+            cust = c
+            break
+    if not cust:
+        return "❌ Customer not found."
 
-    # If not recognized
-    return "Sorry, I did not understand the command."
+    # Check if asking for balance
+    if "balance" in norm_cmd or "khata" in norm_cmd or "کھاتہ" in command:
+        txs = db.query(Transaction).options(joinedload(Transaction.items)).filter(
+            Transaction.customer_id == cust.id
+        ).all()
+        bal = 0.0
+        for t in txs:
+            amt = tx_amount(t)
+            if t.type == "debit":
+                bal += amt
+            else:
+                bal -= amt
+        return f"📊 Balance for {cust.name or cust.name_ur}: {bal:,.2f}"
+
+    # Check for payment keywords
+    if "ادائیگی" in command or "payment" in norm_cmd or "pay" in norm_cmd:
+        m = re.search(r"\d+", norm_cmd)
+        if not m:
+            return "❌ Could not detect payment amount."
+        amount = float(m.group())
+        tx = Transaction(type="credit", customer_id=cust.id, created_at=datetime.now())
+        db.add(tx)
+        db.add(TransactionItem(transaction=tx, item_id=None, quantity=1, unit_price=amount, total_price=amount))
+        db.commit()
+        if lang == "اردو":
+            return f"✅ ادائیگی {amount:,.0f} محفوظ ہوگئی {cust.name_ur or cust.name} کے لئے."
+        else:
+            return f"✅ Payment of {amount:,.0f} saved for {cust.name or cust.name_ur}."
+
+    # Check for sale items
+    items = db.query(Item).all()
+    for it in items:
+        if normalize_text(it.name) in norm_cmd or normalize_text(it.name_ur) in norm_cmd:
+            m = re.search(r"\d+", norm_cmd)
+            qty = int(m.group()) if m else 1
+            tx = Transaction(type="debit", customer_id=cust.id, created_at=datetime.now())
+            db.add(tx)
+            db.add(TransactionItem(transaction=tx, item_id=it.id, quantity=qty,
+                                   unit_price=it.price, total_price=qty * it.price))
+            db.commit()
+            if lang == "اردو":
+                return f"✅ فروخت محفوظ ہوگئی: {qty} x {it.name_ur or it.name} برائے {cust.name_ur or cust.name}."
+            else:
+                return f"✅ Sale saved: {qty} x {it.name or it.name_ur} for {cust.name or cust.name_ur}."
+
+    return "❌ I understood the customer but could not detect item or payment."
 
 
 # ----------------------------------------------------------------------------
@@ -433,6 +467,90 @@ def customer_ledger_tab_content(lang: str):
 
     df = pd.DataFrame(rows, columns=["Date", "Type", "Items", "Amount", "Balance"])
     st.dataframe(df, use_container_width=True)
+
+    # ------------------------------------------------------------------------
+    # Edit/Delete Existing Transactions
+    # ------------------------------------------------------------------------
+    st.markdown("### ✏️ Edit or ❌ Delete Transaction")
+
+    if txs:
+        tx_options = {f"{tx.id} - {tx.created_at.strftime('%Y-%m-%d')} - {tx.type} - {tx_amount(tx):,.2f}": tx.id for tx in txs}
+        sel_tx_label = st.selectbox("Select Transaction", list(tx_options.keys()), key="ledger_edit_select")
+        sel_tx_id = tx_options[sel_tx_label]
+
+        with DBSession() as db:
+            sel_tx = db.query(Transaction).options(joinedload(Transaction.items)).get(sel_tx_id)
+
+        if sel_tx:
+            if sel_tx.type == "debit":
+                st.markdown("**Edit Sale**")
+                new_qty = st.number_input("Quantity", min_value=1, value=sel_tx.items[0].quantity if sel_tx.items else 1, key="edit_qty")
+                new_rate = st.number_input("Rate", min_value=0.0, value=sel_tx.items[0].unit_price if sel_tx.items else 0.0, key="edit_rate")
+                if st.button("💾 Update Sale"):
+                    with DBSession() as db:
+                        tx_upd = db.query(TransactionItem).filter(TransactionItem.transaction_id == sel_tx.id).first()
+                        if tx_upd:
+                            tx_upd.quantity = new_qty
+                            tx_upd.unit_price = new_rate
+                            tx_upd.total_price = new_qty * new_rate
+                            db.commit()
+                            st.success("✅ Sale updated!")
+                            st.experimental_rerun()
+            else:
+                st.markdown("**Edit Payment**")
+                new_amt = st.number_input("Payment Amount", min_value=0.0, value=sel_tx.items[0].total_price if sel_tx.items else 0.0, key="edit_payment")
+                if st.button("💾 Update Payment"):
+                    with DBSession() as db:
+                        tx_upd = db.query(TransactionItem).filter(TransactionItem.transaction_id == sel_tx.id).first()
+                        if tx_upd:
+                            tx_upd.unit_price = new_amt
+                            tx_upd.total_price = new_amt
+                            db.commit()
+                            st.success("✅ Payment updated!")
+                            st.experimental_rerun()
+
+            if st.button("❌ Delete Transaction"):
+                with DBSession() as db:
+                    tx_del = db.query(Transaction).get(sel_tx.id)
+                    if tx_del:
+                        db.delete(tx_del)
+                        db.commit()
+                        st.warning("❌ Transaction deleted!")
+                        st.experimental_rerun()
+
+    # ------------------------------------------------------------------------
+    # Inline Add Missing Transaction
+    # ------------------------------------------------------------------------
+    st.markdown("### ➕ Add Missing Transaction (Inline)")
+
+    tx_type_inline = st.radio("Type / قسم", ["Sale / فروخت", "Payment / ادائیگی"], key="inline_tx_type")
+
+    if "Sale" in tx_type_inline:
+        with DBSession() as db:
+            items_db = db.query(Item).order_by(Item.id.asc()).all()
+        it = st.selectbox("Item", items_db, format_func=lambda x: format_item(x, lang), key="inline_sale_item")
+        qty = st.number_input("Quantity", min_value=1, value=1, step=1, key="inline_sale_qty")
+        rate = st.number_input("Rate", min_value=0.0, value=float(it.price or 0.0), key="inline_sale_rate")
+        if st.button("💾 Save Inline Sale"):
+            with DBSession() as db:
+                tx = Transaction(type="debit", customer_id=sel_customer.id, created_at=datetime.now())
+                db.add(tx)
+                db.add(TransactionItem(transaction=tx, item_id=it.id, quantity=qty,
+                                       unit_price=rate, total_price=qty * rate))
+                db.commit()
+                st.success("✅ Inline Sale added!")
+                st.experimental_rerun()
+    else:
+        amount = st.number_input("Payment Amount", min_value=0.0, value=0.0, key="inline_payment_amt")
+        if st.button("💾 Save Inline Payment"):
+            with DBSession() as db:
+                tx = Transaction(type="credit", customer_id=sel_customer.id, created_at=datetime.now())
+                db.add(tx)
+                db.add(TransactionItem(transaction=tx, item_id=None, quantity=1,
+                                       unit_price=amount, total_price=amount))
+                db.commit()
+                st.success("✅ Inline Payment added!")
+                st.experimental_rerun()
 
     # Export
     st.download_button(
